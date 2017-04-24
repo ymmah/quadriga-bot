@@ -98,7 +98,7 @@ def entry_point():
                     currency,
                     direction,
                     cur_price,
-                    last_time.astimezone(tz).strftime('%Y-%m-%d %I:%M %p')
+                    tz.localize(last_time).strftime('%Y-%m-%d %I:%M %p')
                 )
                 email_message += 'For more information visit: {}.'.format(
                     QUADRIGACX_URL + config['url_path']
