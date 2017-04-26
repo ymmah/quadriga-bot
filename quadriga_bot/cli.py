@@ -2,38 +2,17 @@ from __future__ import unicode_literals
 
 import io
 import os
-import sys
 import json
 import time
 import datetime
 import logging
 import smtplib
+import multiprocessing
 
 import pytz
 import quadriga
 
-
-QUADRIGACX_URL = 'https://www.quadrigacx.com'
-DEFAULT_CONFIG_PATH = '~/.quadriga-bot'
-DEFAULT_CONFIG_SETTINGS = {
-    # The order book to poll
-    'order_book': 'eth_cad',
-    # QuadrigaCX URL path for the link in the message
-    'url_path': '/trade/eth/cad',
-    # Price delta to send emails on
-    'price_delta': 2,
-    # Number of seconds to sleep after each poll
-    'poll_wait': 10,
-    # Sender (bot) email address
-    'sender_email': None,
-    # Sender (bot) email password
-    'sender_password': None,
-    # Recipient email addresses
-    'to_emails': None,
-    # Timezone to use for datetime
-    'timezone': 'Canada/Pacific'
-}
-
+# Set up the logger
 logger = logging.getLogger('quadriga-bot')
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
@@ -41,85 +20,65 @@ formatter = logging.Formatter(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 file_handler = logging.FileHandler('quadriga-bot.log')
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(formatter)
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
+DEFAULT_CONFIG = {
+    # The order book to poll
+    'order_book': 'eth_cad',
+    # QuadrigaCX URL path for the link in the message
+    'url_path': '/trade/eth/cad',
+    # Price delta threshold to send emails on
+    'max_delta': 2,
+    # Number of seconds to sleep after each poll
+    'sleep': 10,
+    # Sender (bot) email address
+    'sender_email': None,
+    # Sender (bot) email password
+    'sender_password': None,
+    # Recipient email addresses
+    'to_emails': None,
+    # Timezone to use for datetime
+    'timezone': 'Canada/Pacific',
+    # Timeout for each request
+    'timeout': 10,
+    # Number of seconds to wait before sending out an email anyway
+    'max_idle': 3600 * 12
+}
+# Load the bot configuration from ~/.quadriga-bot
+config = DEFAULT_CONFIG.copy()
+with io.open(os.path.expanduser('~/.quadriga-bot'), mode='rt') as fp:
+    config.update(json.load(fp))
 
-def abort_program(message, error_code=1):
-    logger.error(message)
-    sys.exit(error_code)
+for setting in DEFAULT_CONFIG.keys():
+    if config.get(setting) is None:
+        raise ValueError('Config file is missing key "{}"'.format(setting))
 
+quadriga_client = quadriga.QuadrigaClient(default_book=config['order_book'])
 
-def entry_point():
-    logger.info('Starting QuadrigaCX bot ...')
-    config = DEFAULT_CONFIG_SETTINGS
-    config_path = os.path.abspath(os.path.expanduser(DEFAULT_CONFIG_PATH))
-    try:
-        with io.open(config_path, mode='rt') as config_file:
-            config.update(json.load(config_file))
-    except (IOError, OSError, ValueError):
-        abort_program('Missing or bad config file "{}"'.format(config_path))
-
-    for setting in DEFAULT_CONFIG_SETTINGS.keys():
-        if config[setting] is None:
-            abort_program('Config file missing key "{}"'.format(setting))
-
-    currency = 'Ether' if 'eth' in config['order_book'] else 'Bitcoin'
-    tz = pytz.timezone(config['timezone'])
-
-    client = quadriga.QuadrigaClient(default_book=config['order_book'])
-    summary = client.get_summary()
-    last_price = float(summary['last'])
-    last_time = datetime.datetime.now()
-
-    while True:
-        try:
-            summary = client.get_summary()
-            cur_price = float(summary['last'])
-            cur_time = datetime.datetime.now()
-            logger.info('Last trade at {}'.format(cur_price))
-        except Exception as err:
-            logger.warn('Failed to get summary: {}'.format(err))
-        else:
-            if abs(last_price - cur_price) >= config['price_delta']:
-                direction = 'down' if last_price > cur_price else 'up'
-                logger.info(
-                    'Significant price change detected. '
-                    'Sending emails to {} ...'.format(config['to_emails'])
-                )
-                email_subject = '{} went {} to ${}!'.format(
-                    currency, direction, cur_price
-                )
-                email_message = '{} went {} to ${} since {}.\n\n'.format(
-                    currency,
-                    direction,
-                    cur_price,
-                    tz.localize(last_time).strftime('%Y-%m-%d %I:%M %p')
-                )
-                email_message += 'For more information visit: {}.'.format(
-                    QUADRIGACX_URL + config['url_path']
-                )
-                try:
-                    send_email(
-                        config['sender_email'],
-                        config['sender_password'],
-                        config['to_emails'],
-                        email_subject,
-                        email_message,
-                    )
-                except Exception as err:
-                    logger.exception('Failed to send email(s): {}'.format(err))
-                last_price = cur_price
-                last_time = cur_time
-
-        time.sleep(config['poll_wait'])
+sender_email = config['sender_email']
+sender_pass = config['sender_password']
+to_emails = config['to_emails']
+timeout = int(config['timeout'])
+sleep = int(config['sleep'])
+max_idle = int(config['max_idle'])
+max_delta = int(config['max_delta'])
+url = 'https://www.quadrigacx.com' + config['url_path']
+tz = pytz.timezone(config['timezone'])
+coin = 'Ether' if 'eth' in config['order_book'] else 'Bitcoin'
 
 
-def send_email(sender_email, sender_password, to_emails, subject, message):
+def get_price():
+    summary = quadriga_client.get_summary()
+    return float(summary['last'])
+
+
+def send_email(subject, message):
+    logger.info('Sending emails to {} ...'.format(to_emails))
     header = '\n'.join([
         'From: {}'.format(sender_email),
         'To: {}'.format(','.join(to_emails)),
@@ -128,7 +87,43 @@ def send_email(sender_email, sender_password, to_emails, subject, message):
     server = smtplib.SMTP('smtp.gmail.com:587')
     server.ehlo()
     server.starttls()
-    server.login(sender_email, sender_password)
-    result = server.sendmail(sender_email, to_emails, header + message)
+    server.login(sender_email, sender_pass)
+    server.sendmail(sender_email, to_emails, header + message)
     server.quit()
-    return result
+
+
+def entry_point():
+    logger.info('Starting QuadrigaCX bot ...')
+    pool = multiprocessing.Pool(processes=1)
+    last_price = pool.apply_async(get_price).get(timeout)
+    last_time = datetime.datetime.now()
+    logger.info('Last trade was at ${}'.format(last_price))
+
+    while True:
+        time.sleep(sleep)
+        try:
+            cur_price = pool.apply_async(get_price).get(timeout)
+        except multiprocessing.TimeoutError:
+            logger.warn('Timeout while polling QuadrigaCX')
+        except Exception as err:
+            logger.warn('Failed to poll QuadrigaCX: {}'.format(err))
+        else:
+            if cur_price > last_price:
+                logger.info('Last trade went up to ${}'.format(cur_price))
+            elif cur_price < last_price:
+                logger.info('Last trade went down to ${}'.format(cur_price))
+
+            cur_time = datetime.datetime.now()
+            delta = abs(last_price - cur_price)
+            idle = (cur_time - last_time).total_seconds()
+
+            if (idle >= max_idle and delta) or (delta >= max_delta):
+                trend = 'down' if last_price > cur_price else 'up'
+                since = tz.localize(last_time).strftime('%Y-%m-%d %I:%M %p')
+                send_email(
+                    subject='{} went {} to ${}!'.format(coin, trend, cur_price),
+                    message='{} went {} to ${} since {}.\n\n'.format(
+                        coin, trend, cur_price, since
+                    ) + 'For more information visit: {}.'.format(url)
+                )
+                last_price, last_time = cur_price, cur_time
