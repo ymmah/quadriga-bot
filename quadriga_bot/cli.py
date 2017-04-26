@@ -78,7 +78,6 @@ def get_price():
 
 
 def send_email(subject, message):
-    logger.info('Sending emails to {} ...'.format(to_emails))
     header = '\n'.join([
         'From: {}'.format(sender_email),
         'To: {}'.format(','.join(to_emails)),
@@ -97,7 +96,6 @@ def entry_point():
     pool = multiprocessing.Pool(processes=1)
     last_price = pool.apply_async(get_price).get(timeout)
     last_time = datetime.datetime.now()
-    logger.info('Last trade was at ${}'.format(last_price))
 
     while True:
         time.sleep(sleep)
@@ -108,16 +106,14 @@ def entry_point():
         except Exception as err:
             logger.warn('Failed to poll QuadrigaCX: {}'.format(err))
         else:
-            if cur_price > last_price:
-                logger.info('Last trade went up to ${}'.format(cur_price))
-            elif cur_price < last_price:
-                logger.info('Last trade went down to ${}'.format(cur_price))
+            logger.debug('Last trade at ${}'.format(cur_price))
 
             cur_time = datetime.datetime.now()
             delta = abs(last_price - cur_price)
             idle = (cur_time - last_time).total_seconds()
 
             if (idle >= max_idle and delta) or (delta >= max_delta):
+                logger.info('Sending emails to {} ...'.format(to_emails))
                 trend = 'down' if last_price > cur_price else 'up'
                 since = tz.localize(last_time).strftime('%Y-%m-%d %I:%M %p')
                 send_email(
