@@ -20,14 +20,13 @@ formatter = logging.Formatter(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 file_handler = logging.FileHandler('quadriga-bot.log')
-file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(formatter)
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
-DEFAULT_CONFIG = {
+default_config = {
     # The order book to poll
     'order_book': 'eth_cad',
     # QuadrigaCX URL path for the link in the message
@@ -35,7 +34,7 @@ DEFAULT_CONFIG = {
     # Price delta threshold to send emails on
     'max_delta': 2,
     # Number of seconds to sleep after each poll
-    'sleep': 10,
+    'sleep_duration': 5,
     # Sender (bot) email address
     'sender_email': None,
     # Sender (bot) email password
@@ -49,77 +48,115 @@ DEFAULT_CONFIG = {
     # Number of seconds to wait before sending out an email anyway
     'max_idle': 3600 * 12
 }
-# Load the bot configuration from ~/.quadriga-bot
-config = DEFAULT_CONFIG.copy()
-with io.open(os.path.expanduser('~/.quadriga-bot'), mode='rt') as fp:
-    config.update(json.load(fp))
-
-for setting in DEFAULT_CONFIG.keys():
-    if config.get(setting) is None:
-        raise ValueError('Config file is missing key "{}"'.format(setting))
-
-quadriga_client = quadriga.QuadrigaClient(default_book=config['order_book'])
-
-sender_email = config['sender_email']
-sender_pass = config['sender_password']
-to_emails = config['to_emails']
-timeout = int(config['timeout'])
-sleep = int(config['sleep'])
-max_idle = int(config['max_idle'])
-max_delta = int(config['max_delta'])
-url = 'https://www.quadrigacx.com' + config['url_path']
-tz = pytz.timezone(config['timezone'])
-coin = 'Ether' if 'eth' in config['order_book'] else 'Bitcoin'
+order_books = {'btc_cad', 'btc_usd', 'eth_cad', 'eth_usd'}
+coins = {'eth': 'Ether', 'btc': 'Bitcoin'}
+client = quadriga.QuadrigaClient()
 
 
-def get_price():
-    summary = quadriga_client.get_summary()
-    return float(summary['last'])
+def load_config():
+    config = default_config.copy()
+    with io.open(os.path.expanduser('~/.quadriga-bot'), mode='rt') as fp:
+        config.update(json.load(fp))
+
+    for key in default_config.keys():
+        if config.get(key) is None:
+            raise ValueError('missing config key "{}"'.format(key))
+
+    if config['order_book'] not in order_books:
+        raise ValueError('invalid order book "{}"'.format(config['order_book']))
+    if '@gmail.com' not in config['sender_email']:
+        raise ValueError('only @gmail.com is supported for bot email')
+    if not isinstance(config['to_emails'], list):
+        raise ValueError('"to_emails" not a list of email addresses')
+
+    for key in ['max_idle', 'max_delta', 'sleep_duration', 'timeout']:
+        try:
+            config[key] = int(config[key])
+        except (TypeError, ValueError):
+            raise ValueError(
+                'config key "{}" has a non-numeric value: {}'
+                .format(key, config[key])
+            )
+    try:
+        pytz.timezone(config['timezone'])
+    except pytz.exceptions.UnknownTimeZoneError:
+        raise ValueError('invalid timezone "{}"'.format(config['timezone']))
+    return config
 
 
-def send_email(subject, message):
-    header = '\n'.join([
-        'From: {}'.format(sender_email),
-        'To: {}'.format(','.join(to_emails)),
-        'Subject: {}\n'.format(subject)
-    ])
-    server = smtplib.SMTP('smtp.gmail.com:587')
-    server.ehlo()
-    server.starttls()
-    server.login(sender_email, sender_pass)
-    server.sendmail(sender_email, to_emails, header + message)
-    server.quit()
+def get_price(order_book):
+    summary = client.get_summary(order_book)
+    return float(summary['ask'])
+
+
+def send_email(sender_email, sender_pass, to_emails, subject, message):
+    logger.debug('Alerting {} ...'.format(to_emails))
+    try:
+        header = '\n'.join([
+            'From: {}'.format(sender_email),
+            'To: {}'.format(','.join(to_emails)),
+            'Subject: {}\n'.format(subject)
+        ])
+        server = smtplib.SMTP('smtp.gmail.com:587')
+        server.ehlo()
+        server.starttls()
+        server.login(sender_email, sender_pass)
+        server.sendmail(sender_email, to_emails, header + message)
+        server.quit()
+    except Exception as err:
+        logger.error('Failed to send alerts: {}'.format(err))
 
 
 def entry_point():
-    logger.info('Starting QuadrigaCX bot ...')
+    logger.debug('Starting QuadrigaCX price checker ...')
     pool = multiprocessing.Pool(processes=1)
-    last_price = pool.apply_async(get_price).get(timeout)
+    last_price = get_price(load_config()['order_book'])
     last_time = datetime.datetime.now()
 
     while True:
-        time.sleep(sleep)
         try:
-            cur_price = pool.apply_async(get_price).get(timeout)
-        except multiprocessing.TimeoutError:
-            logger.warn('Timeout while polling QuadrigaCX')
+            config = load_config()
         except Exception as err:
-            logger.warn('Failed to poll QuadrigaCX: {}'.format(err))
+            logger.error('Failed to load config: {}'.format(err))
+            time.sleep(default_config['timeout'])
+            continue
+        try:
+            process_task = pool.apply_async(get_price, [config['order_book']])
+            cur_price = process_task.get(int(config['timeout']))
+        except multiprocessing.TimeoutError:
+            logger.error('Timeout while polling QuadrigaCX')
+        except Exception as err:
+            logger.error('Failed to poll QuadrigaCX: {}'.format(err))
         else:
-            logger.debug('Last trade at ${}'.format(cur_price))
+            major, minor = config['order_book'].lower().split('_')
+            major, minor = coins[major], minor.upper()
 
             cur_time = datetime.datetime.now()
             delta = abs(last_price - cur_price)
             idle = (cur_time - last_time).total_seconds()
 
-            if (idle >= max_idle and delta) or (delta >= max_delta):
-                logger.info('Sending emails to {} ...'.format(to_emails))
+            logger.debug('Last sell price for {}: ${:,.2f} {}'.format(
+                major.lower(), cur_price, minor
+            ))
+            if ((idle >= config['max_idle']) and delta) or \
+                    (delta >= config['max_delta']):
+
                 trend = 'down' if last_price > cur_price else 'up'
+                tz = pytz.timezone(config['timezone'])
                 since = tz.localize(last_time).strftime('%Y-%m-%d %I:%M %p')
                 send_email(
-                    subject='{} went {} to ${}!'.format(coin, trend, cur_price),
-                    message='{} went {} to ${} since {}.\n\n'.format(
-                        coin, trend, cur_price, since
-                    ) + 'For more information visit: {}.'.format(url)
+                    sender_email=config['sender_email'],
+                    sender_pass=config['sender_password'],
+                    to_emails=config['to_emails'],
+                    subject='{} went {} to ${:,.2f} {}!'.format(
+                        major, trend, cur_price, minor
+                    ),
+                    message='{} went {} to ${:,.2f} {} since {}.\n\n'.format(
+                        major, trend, cur_price, minor, since
+                    ) + 'For more information visit: {}'.format(
+                        'https://www.quadrigacx.com' + config['url_path']
+                    )
                 )
                 last_price, last_time = cur_price, cur_time
+
+            time.sleep(int(config['sleep_duration']))
