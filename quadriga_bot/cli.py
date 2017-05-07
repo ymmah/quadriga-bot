@@ -34,7 +34,7 @@ default_config = {
     # Price delta threshold to send emails on
     'max_delta': 2,
     # Number of seconds to sleep after each poll
-    'sleep_duration': 5,
+    'sleep': 5,
     # Sender (bot) email address
     'sender_email': None,
     # Sender (bot) email password
@@ -46,7 +46,9 @@ default_config = {
     # Timeout for each request
     'timeout': 10,
     # Number of seconds to wait before sending out an email anyway
-    'max_idle': 3600 * 12
+    'max_idle': 3600 * 12,
+    # Number of polls before a new process is spawned
+    'process_ttl': 10000
 }
 order_books = {'btc_cad', 'btc_usd', 'eth_cad', 'eth_usd'}
 coins = {'eth': 'Ether', 'btc': 'Bitcoin'}
@@ -69,7 +71,7 @@ def load_config():
     if not isinstance(config['to_emails'], list):
         raise ValueError('"to_emails" not a list of email addresses')
 
-    for key in ['max_idle', 'max_delta', 'sleep_duration', 'timeout']:
+    for key in ['max_idle', 'max_delta', 'sleep', 'timeout', 'process_ttl']:
         try:
             config[key] = int(config[key])
         except (TypeError, ValueError):
@@ -104,7 +106,7 @@ def send_email(sender_email, sender_pass, to_emails, subject, message):
         server.sendmail(sender_email, to_emails, header + message)
         server.quit()
     except Exception as err:
-        logger.error('Failed to send alerts: {}'.format(err))
+        logger.exception('Failed to send alerts: {}'.format(err))
 
 
 def entry_point():
@@ -112,21 +114,30 @@ def entry_point():
     pool = multiprocessing.Pool(processes=1)
     last_price = get_price(load_config()['order_book'])
     last_time = datetime.datetime.now()
+    iterations = 0
 
     while True:
         try:
             config = load_config()
         except Exception as err:
-            logger.error('Failed to load config: {}'.format(err))
-            time.sleep(default_config['timeout'])
+            logger.exception('Failed to load config: {}'.format(err))
+            time.sleep(default_config['sleep'])
             continue
+        if iterations > config['process_ttl']:
+            try:
+                pool.terminate()
+            except Exception as err:
+                logger.exception('Failed to terminate process: {}'.format(err))
+            finally:
+                pool = multiprocessing.Pool(processes=1)
+                iterations = 0
         try:
             process_task = pool.apply_async(get_price, [config['order_book']])
             cur_price = process_task.get(int(config['timeout']))
         except multiprocessing.TimeoutError:
-            logger.error('Timeout while polling QuadrigaCX')
+            logger.exception('Timeout while polling QuadrigaCX')
         except Exception as err:
-            logger.error('Failed to poll QuadrigaCX: {}'.format(err))
+            logger.exception('Failed to poll QuadrigaCX: {}'.format(err))
         else:
             major, minor = config['order_book'].lower().split('_')
             major, minor = coins[major], minor.upper()
@@ -159,4 +170,5 @@ def entry_point():
                 )
                 last_price, last_time = cur_price, cur_time
 
-            time.sleep(int(config['sleep_duration']))
+            time.sleep(int(config['sleep']))
+            iterations += 1
