@@ -50,7 +50,7 @@ default_config = {
     # Number of polls before a new process is spawned
     'process_ttl': 10000
 }
-order_books = {'btc_cad', 'btc_usd', 'eth_cad', 'eth_usd'}
+order_books = {'btc_cad', 'btc_usd', 'eth_cad', 'eth_btc'}
 coins = {'eth': 'Ether', 'btc': 'Bitcoin'}
 client = quadriga.QuadrigaClient()
 
@@ -169,6 +169,6 @@ def entry_point():
                     )
                 )
                 last_price, last_time = cur_price, cur_time
-
+        finally:
             time.sleep(int(config['sleep']))
             iterations += 1
